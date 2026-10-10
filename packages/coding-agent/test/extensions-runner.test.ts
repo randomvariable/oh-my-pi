@@ -1538,6 +1538,227 @@ describe("ExtensionRunner", () => {
 			});
 		});
 
+		it("honors a per-extension context budget while siblings keep the host default", async () => {
+			const optedExtensionPath = path.join(tempDir.path(), "budgeted-context.ts");
+			const siblingExtensionPath = path.join(tempDir.path(), "default-budget-context.ts");
+			fs.writeFileSync(
+				optedExtensionPath,
+				`
+					export default function(pi) {
+						pi.setHandlerTimeout("context", 60);
+						const gate = Promise.withResolvers();
+						globalThis.__budgetedContextGate = gate;
+						pi.on("context", async event => {
+							await gate.promise;
+							return { messages: [...event.messages, { role: "user", content: "opted-in", timestamp: 2 }] };
+						});
+					}
+				`,
+			);
+			fs.writeFileSync(
+				siblingExtensionPath,
+				`
+					export default function(pi) {
+						pi.on("context", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+
+			const loaded = await loadTestExtensions([optedExtensionPath, siblingExtensionPath]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn");
+			testSetExtensionHandlerTimeoutMs(10);
+
+			vi.useFakeTimers();
+			try {
+				let settled = false;
+				const emitted = runner
+					.emitContext([{ role: "user", content: "hello", timestamp: 1 }])
+					.then(messages => {
+						settled = true;
+						return messages;
+					});
+				// Release the opted-in handler deterministically (no wall-clock timer),
+				// then drive the sibling's 10ms default timeout with fake time.
+				globalThis.__budgetedContextGate.resolve();
+				for (let tick = 0; tick < 40 && !settled; tick++) {
+					await Promise.resolve();
+					vi.advanceTimersByTime(1);
+				}
+				const transformed = await emitted;
+
+				// Without the override the 10ms default would have timed A out at the
+				// same fake instant as B; A instead completed and B hit the default.
+				expect(transformed).toHaveLength(2);
+				expect(transformed[1].content).toBe("opted-in");
+				expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
+					extensionPath: siblingExtensionPath,
+					event: "context",
+					timeoutMs: 10,
+				});
+				expect(warnSpy.mock.calls.filter(call => call[1]?.extensionPath === optedExtensionPath)).toEqual([]);
+			} finally {
+				vi.useRealTimers();
+				warnSpy.mockRestore();
+				delete globalThis.__budgetedContextGate;
+			}
+		});
+
+		it("restores the host default when an override is reset with undefined", async () => {
+			const extensionPath = path.join(tempDir.path(), "reset-context-budget.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.setHandlerTimeout("context", 60);
+						pi.setHandlerTimeout("context", undefined);
+						pi.on("context", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+
+			const loaded = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => {
+				errors.push(error);
+			});
+			testSetExtensionHandlerTimeoutMs(10);
+
+			vi.useFakeTimers();
+			try {
+				const messages = [{ role: "user", content: "hello", timestamp: 1 }];
+				let settled = false;
+				const emitted = runner.emitContext(messages).then(result => {
+					settled = true;
+					return result;
+				});
+
+				vi.advanceTimersByTime(9);
+				expect(settled).toBe(false);
+
+				vi.advanceTimersByTime(1);
+				await Promise.resolve();
+				await Promise.resolve();
+				vi.advanceTimersByTime(0);
+				// A live 60ms override would not fire by 10ms; the reset must fall
+				// back to the default and keep the fail-open passthrough.
+				expect(await emitted).toEqual(messages);
+				expect(errors).toContainEqual({
+					extensionPath,
+					event: "context",
+					error: "handler timed out after 10ms",
+				});
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("validates setHandlerTimeout: invalid values throw without touching state", async () => {
+			const extensionPath = path.join(tempDir.path(), "budget-validation.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						const probe = [];
+						for (const invalid of [0, -5, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2147483648]) {
+							try {
+								pi.setHandlerTimeout("context", invalid);
+								probe.push("accepted:" + invalid);
+							} catch (error) {
+								probe.push(error instanceof RangeError ? "range:" + error.message : "wrong:" + error);
+							}
+						}
+						globalThis.__handlerTimeoutProbe = probe;
+						pi.setHandlerTimeout("context", 60);
+						pi.setHandlerTimeout("context", 45);
+					}
+				`,
+			);
+
+			const loaded = await loadTestExtensions([extensionPath]);
+
+			expect(globalThis.__handlerTimeoutProbe).toEqual(
+				Array.from({ length: 6 }, () => "range:Handler timeout must be a positive integer no greater than 2147483647ms"),
+			);
+			// Every invalid call was a no-op; the last valid write wins.
+			expect([...(loaded.extensions[0].handlerTimeouts ?? new Map())]).toEqual([["context", 45]]);
+			delete globalThis.__handlerTimeoutProbe;
+		});
+
+		it("clamps a session_shutdown override to the teardown cap", async () => {
+			const extensionPath = path.join(tempDir.path(), "shutdown-budget.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.setHandlerTimeout("session_shutdown", 60_000);
+						pi.on("session_shutdown", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+
+			const loaded = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => {
+				errors.push(error);
+			});
+			testSetSessionShutdownHandlerTimeoutMs(10);
+
+			vi.useFakeTimers();
+			try {
+				let settled = false;
+				const emitted = runner.emit({ type: "session_shutdown" }).then(() => {
+					settled = true;
+				});
+
+				vi.advanceTimersByTime(9);
+				expect(settled).toBe(false);
+
+				vi.advanceTimersByTime(1);
+				for (let tick = 0; tick < 20 && !settled; tick++) {
+					await Promise.resolve();
+					// The timeout cleanup race uses Bun.sleep(0), which fake timers
+					// also control: keep advancing or it never fires.
+					vi.advanceTimersByTime(1);
+				}
+				await emitted;
+				// The 60s override must not prolong teardown past the 10ms shutdown cap.
+				expect(errors).toContainEqual({
+					extensionPath,
+					event: "session_shutdown",
+					error: "handler timed out after 10ms",
+				});
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
 		it("uses the configured tool_call timeout and fails closed so a hung extension cannot block execution (#3948)", async () => {
 			const hangExtensionPath = path.join(tempDir.path(), "hang-tool-call.ts");
 			fs.writeFileSync(

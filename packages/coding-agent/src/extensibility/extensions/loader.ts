@@ -44,6 +44,7 @@ import type {
 	Extension,
 	ExtensionAPI,
 	ExtensionContext,
+	ExtensionEvent,
 	ExtensionFactory,
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
@@ -211,6 +212,20 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
 		this.extension.handlers.set(event, list);
+	}
+
+	setHandlerTimeout(event: ExtensionEvent["type"], timeoutMs: number | undefined): void {
+		// Validate before touching prior state so a rejected call is a no-op.
+		if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647)) {
+			throw new RangeError("Handler timeout must be a positive integer no greater than 2147483647ms");
+		}
+		if (timeoutMs === undefined) {
+			this.extension.handlerTimeouts?.delete(event);
+			return;
+		}
+		// The map is allocated lazily so extensions that never call this keep the
+		// exact object shape existing fixtures and equality checks rely on.
+		(this.extension.handlerTimeouts ??= new Map()).set(event, timeoutMs);
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {

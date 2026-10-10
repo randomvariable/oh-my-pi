@@ -1285,6 +1285,18 @@ export class ExtensionRunner {
 		onFailure?: (kind: "timeout" | "error", message: string) => R,
 		outerSignal?: AbortSignal,
 	): Promise<R | undefined> {
+		// Per-extension budget from `setHandlerTimeout`, resolved once here so
+		// every dispatch loop inherits it. `session_shutdown` clamps to the
+		// caller-supplied teardown cap: an extension may shorten teardown, never
+		// prolong it. All other event failure policies (e.g. tool_call's
+		// fail-closed block) are unchanged; only their duration differs.
+		const overrideMs = ext.handlerTimeouts?.get(event.type);
+		const effectiveTimeoutMs =
+			overrideMs === undefined
+				? timeoutMs
+				: event.type === "session_shutdown"
+					? Math.min(overrideMs, timeoutMs)
+					: overrideMs;
 		// `session_stop` carries its own signal on the event; `tool_call` receives
 		// the outer dispatch signal (loop request or wrapper execute) so an abort
 		// while a handler awaits a human dialog cancels the dialog and settles the
@@ -1324,7 +1336,7 @@ export class ExtensionRunner {
 						}
 						return result;
 					},
-					timeoutMs,
+					effectiveTimeoutMs,
 					signal,
 				),
 			);
@@ -1335,11 +1347,11 @@ export class ExtensionRunner {
 		}
 		if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
 		if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
-			const error = `handler timed out after ${timeoutMs}ms`;
+			const error = `handler timed out after ${effectiveTimeoutMs}ms`;
 			logger.warn("Extension handler timed out", {
 				extensionPath: ext.path,
 				event: event.type,
-				timeoutMs,
+				timeoutMs: effectiveTimeoutMs,
 			});
 			this.emitError({
 				extensionPath: ext.path,

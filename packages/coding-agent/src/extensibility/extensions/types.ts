@@ -1290,6 +1290,18 @@ export interface ExtensionAPI {
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
 	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
 
+	/**
+	 * Overrides the per-handler execution budget for one event of THIS extension
+	 * only. Applies to every handler registered for the event, including ones
+	 * registered later; repeated calls replace the override and `undefined`
+	 * restores the host default. A `session_shutdown` override is clamped to the
+	 * shutdown cap — an extension may shorten teardown, never prolong it. Other
+	 * per-event policies (e.g. the tool-call fail-closed block) are unchanged;
+	 * only their duration differs. Valid values are positive integers up to
+	 * 2147483647ms; anything else throws without changing prior state.
+	 */
+	setHandlerTimeout(event: ExtensionEvent["type"], timeoutMs: number | undefined): void;
+
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
@@ -1754,6 +1766,8 @@ export interface Extension {
 	resolvedPath: string;
 	label?: string;
 	handlers: Map<string, HandlerFn[]>;
+	/** Per-extension event budgets set via `setHandlerTimeout`; absent = host default. */
+	handlerTimeouts?: Map<string, number>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];
